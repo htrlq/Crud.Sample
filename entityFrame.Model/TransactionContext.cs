@@ -1,10 +1,12 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using AspectCore.DynamicProxy;
+using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
 using System.Text;
 
 namespace entityFrame.Model
 {
+    [NonAspect]
     public class TransactionContexts:DbContext
     {
         public DbSet<PayOrder> PayOrders { get; set; }

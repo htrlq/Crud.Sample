@@ -1,17 +1,19 @@
-﻿using System;
+﻿#undef _001
+
+using entityFrame.Model;
+using GreenPipes;
+using MassTransit;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.DependencyInjection;
-
-using MassTransit;
-using entityFrame.Model;
-using Microsoft.EntityFrameworkCore;
-using Web.Project.Consumer;
 using Web.Project.Command;
+using Web.Project.Consumer;
+using AspectCore.Extensions.DependencyInjection;
 
 namespace Web.Project
 {
@@ -19,35 +21,75 @@ namespace Web.Project
     {
         // This method gets called by the runtime. Use this method to add services to the container.
         // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
-        public void ConfigureServices(IServiceCollection services)
+        public IServiceProvider ConfigureServices(IServiceCollection services)
         {
-            services.AddScoped<TransactionConsumer>();
 
-            services.AddMassTransit(c =>
-            {
-                c.AddConsumer<TransactionConsumer>();
-
-                c.AddBus(serviceProvider =>
+            services
+                .ConfigureDynamicProxy()
+                .AddScoped<TransactionConsumer>()
+                .AddDbContext<TransactionContexts>(build => {
+                    build.UseInMemoryDatabase("TransactionContexts");
+                })
+                .AddMassTransit(c =>
                 {
-                    return Bus.Factory.CreateUsingRabbitMq(cfg =>
-                    {
-                        var host = cfg.Host(new Uri("rabbitmq://localhost/"), hst =>
-                        {
-                            hst.Username("guest");
-                            hst.Password("guest");
-                        });
+                    c.AddConsumer<TransactionConsumer>();
+                    c.AddConsumer<FaultConsumer>();
 
-                        cfg.ReceiveEndpoint("Transaction", config =>
+                    c.AddBus(serviceProvider =>
+                    {
+                        return Bus.Factory.CreateUsingRabbitMq(cfg =>
                         {
-                            config.ConfigureConsumer<TransactionConsumer>(serviceProvider);
+
+                            cfg.SetExchangeArgument("durable", true);
+
+                            var host = cfg.Host(new Uri("rabbitmq://localhost/"), hst =>
+                            {
+                                hst.Username("guest");
+                                hst.Password("guest");
+                            });
+
+                            cfg.ReceiveEndpoint("Transaction", config =>
+                            {
+                                config.Handler<PayOrderRequest>(context =>
+                                {
+                                    var value = context.Message;
+
+                                    var bus = serviceProvider.GetRequiredService<IBusControl>();
+                                    var rpcClient = context.Request<PayOrderEvent, PayOrderResponse>(bus,
+                                        new PayOrderEvent
+                                        {
+                                            SourceId = value.SourceId,
+                                            TargetId = value.TargetId,
+                                            Money = value.Money
+                                        }
+                                    );
+
+                                    var response = rpcClient.Result;
+
+                                    return context.RespondAsync(response.Message);
+                                });
+
+                                EndpointConvention.Map<PayOrderEvent>(config.InputAddress);
+                                EndpointConvention.Map<PayOrderRequest>(config.InputAddress);
+
+
+                                var transactionConsumer = serviceProvider.GetRequiredService<TransactionConsumer>();
+                                Console.WriteLine(transactionConsumer.GetType());
+                                config.Consumer(() => transactionConsumer);
+                                //config.ConfigureConsumer<TransactionConsumer>(serviceProvider);
+                            });
+
+                            cfg.ReceiveEndpoint("Retry", config =>
+                            {
+                                config.ConfigureConsumer<FaultConsumer>(serviceProvider);
+                            });
                         });
                     });
                 });
-            });
 
-            services.AddDbContext<TransactionContexts>(build=> {
-                build.UseInMemoryDatabase("TransactionContexts");
-            });
+            var container = services.BuildDynamicProxyProvider();
+
+            return container;
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -92,6 +134,7 @@ namespace Web.Project
 
             app.Run(async (context) =>
             {
+#if _001
                 await busControl.Publish(new PayOrderCommand
                 {
                     SourceId = 1,
@@ -99,8 +142,82 @@ namespace Web.Project
                     Money = 2000
                 });
 
-                await context.Response.WriteAsync("Hello World!");
+                await context.Response.WriteAsync($"Hello World!");
+#else
+                var entity = new PayOrderEvent
+                {
+                    SourceId = 1,
+                    TargetId = 2,
+                    Money = 2000
+                };
+                //await busControl.Publish(entity);
+                var response = await busControl.Request<PayOrderEvent, PayOrderResponse>(entity);
+
+                //await context.Response.WriteAsync($"Hello World! Success:{response.Message.Success}");
+#endif
             });
         }
+    }
+
+    public static class ExampleMiddlewareConfiguratorExtensions
+    {
+        public static void UseExceptionLogger<T>(this IPipeConfigurator<T> configurator, IServiceProvider serviceProvider)
+            where T : class, PipeContext
+        {
+            configurator.AddPipeSpecification(serviceProvider.GetRequiredService<ExceptionSpecification<T>>());
+        }
+    }
+
+    internal class ExceptionSpecification<T> : IPipeSpecification<T>
+        where T : class, PipeContext
+    {
+        private ExceptionFilter<T> filter;
+
+        public ExceptionSpecification(ExceptionFilter<T> filter)
+        {
+            this.filter = filter;
+        }
+
+        public void Apply(IPipeBuilder<T> builder)
+        {
+            builder.AddFilter(filter);
+        }
+
+        public IEnumerable<ValidationResult> Validate()
+        {
+            return Enumerable.Empty<ValidationResult>();
+        }
+    }
+
+    internal class ExceptionFilter<T> : IFilter<T>
+        where T : class, PipeContext
+    {
+        private IExceptionFilter filter;
+
+        public ExceptionFilter(IExceptionFilter filter)
+        {
+            this.filter = filter;
+        }
+
+        public void Probe(ProbeContext context)
+        {
+        }
+
+        public async Task Send(T context, IPipe<T> next)
+        {
+            try
+            {
+                await next.Send(context);
+            }
+            catch(Exception ex)
+            {
+                await filter.InvokeAsync(ex);
+            }
+        }
+    }
+
+    public interface IExceptionFilter
+    {
+        Task InvokeAsync(Exception exception);
     }
 }
